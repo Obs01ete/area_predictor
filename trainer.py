@@ -1,6 +1,7 @@
 import os
 import sys
 import glob
+import math
 import torch
 import torch.nn as nn
 import numpy as np
@@ -124,29 +125,137 @@ class Decoder:
         return pred
 
 
-class Net(nn.Module):
-    def __init__(self, input_shape_chw):
+class Conv(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, has_relu=True):
+        super().__init__()
+        self._conv = nn.Conv2d(
+            in_channels, out_channels, kernel_size,
+            padding=(kernel_size - 1) // 2, stride=stride)
+        self._relu = nn.ReLU() if has_relu else None
+
+    def forward(self, input):
+        conv = self._conv(input)
+        relu = self._relu(conv) if self._relu is not None else conv
+        return relu
+
+
+class Deconv(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, has_relu=True):
+        super().__init__()
+        self._conv = nn.ConvTranspose2d(
+            in_channels, out_channels, kernel_size,
+            padding=(kernel_size - 1) // 2, stride=stride)
+        self._relu = nn.ReLU() if has_relu else None
+
+    def forward(self, input, **kwargs):
+        conv = self._conv(input, **kwargs)
+        relu = self._relu(conv) if self._relu is not None else conv
+        return relu
+
+
+class SimpleBackbone(nn.Module):
+    def __init__(self, input_shape_chw, featuremap_depth):
         super().__init__()
 
         self.input_shape_chw = input_shape_chw
 
         ch = 16  # 32
         k = 3  # 3
-        featuremap_depth = 1  # 4
 
-        conv1 = nn.Conv2d(input_shape_chw[0], ch, k, padding=(k - 1) // 2)
-        relu1 = nn.ReLU()
-        conv2 = nn.Conv2d(ch, ch // 2, k, padding=(k - 1) // 2)
-        relu2 = nn.ReLU()
-        conv3 = nn.Conv2d(ch // 2, featuremap_depth, k, padding=(k - 1) // 2)
-        self._net = nn.Sequential(conv1, relu1, conv2, relu2, conv3)
+        conv1 = Conv(input_shape_chw[0], ch, k)
+        conv2 = Conv(ch, ch // 2, k)
+        conv3 = Conv(ch // 2, featuremap_depth, k, has_relu=False)
 
-        maxpool_size = 2  # 4
-        self.maxpool = nn.MaxPool2d(maxpool_size, stride=maxpool_size)
-        featuremap_num_elems = \
-            input_shape_chw[1] * input_shape_chw[2] * featuremap_depth // \
-            (maxpool_size * maxpool_size)
-        self._head = nn.Linear(featuremap_num_elems, 2)
+        self._net = nn.Sequential(conv1, conv2, conv3)
+
+    def forward(self, input):
+        return self._net(input)
+
+
+class UNet(nn.Module):
+    def __init__(self, input_shape_chw, featuremap_depth):
+        super().__init__()
+
+        self.input_shape_chw = input_shape_chw
+
+        ch = 8
+        self._first_conv = Conv(input_shape_chw[0], ch, 3)
+        branch_channels = [ch]
+
+        num_levels = min(8, int(math.log2(min(input_shape_chw[1], input_shape_chw[2]))))
+        downscale_list = nn.ModuleList()
+        for _ in range(num_levels):
+            conv1 = Conv(ch, ch, 3)
+            conv2 = Conv(ch, ch * 2, 3, stride=2)
+            downscale_list.append(nn.Sequential(conv1, conv2))
+            branch_channels.append(ch)
+            ch = ch * 2
+        self._downscale_blocks = downscale_list
+
+        upscale_list = nn.ModuleList()
+        for _ in range(num_levels):
+            #nn.Upsample(scale_factor=2, mode='bilinear')
+            deconv = Deconv(ch, ch // 2, 3, stride=2)
+            upscale_list.append(deconv)
+            ch = ch // 2
+        self._upscale_blocks = upscale_list
+
+        self._out_conv = Conv(ch, featuremap_depth, 1)
+
+        pass
+
+    def forward(self, input):
+        t = self._first_conv(input)
+        branch_list = [t]
+        for block in self._downscale_blocks:
+            t = block(t)
+            branch_list.append(t)
+
+        branch_list = branch_list[:-1]
+
+        for i_block, block in enumerate(self._upscale_blocks):
+            upscaled_size = torch.Size((t.size()[2]*2, t.size()[3]*2))
+            t = block(t, output_size=upscaled_size)
+            t = t + branch_list[-i_block-1]
+            pass
+
+        t = self._out_conv(t)
+
+        return t
+
+class DecoderUNet():
+    def __init__(self):
+        pass
+
+    def forward(self, featuremap):
+        featuremap_sig = torch.sigmoid(featuremap)
+        featuremap_w = featuremap_sig[:, 0, :, :].squeeze(1)
+        featuremap_h = featuremap_sig[:, 1, :, :].squeeze(1)
+        pred_w = featuremap_w.sum(dim=2).sum(dim=1, keepdim=True)
+        pred_h = featuremap_h.sum(dim=2).sum(dim=1, keepdim=True)
+        total_area = featuremap.size(2) * featuremap.size(3)
+        pred_frac_w = pred_w / total_area
+        pred_frac_h = pred_h / total_area
+        pred = torch.cat((pred_frac_h, pred_frac_w), dim=1)
+        return pred
+
+
+class Net(nn.Module):
+    def __init__(self, input_shape_chw):
+        super().__init__()
+
+        self.input_shape_chw = input_shape_chw
+
+        featuremap_depth = 2 # 1  # 4
+        #self._net = SimpleBackbone(input_shape_chw, featuremap_depth)
+        self._net = UNet(input_shape_chw, featuremap_depth)
+
+        # maxpool_size = 8  # 4
+        # self.maxpool = nn.MaxPool2d(maxpool_size, stride=maxpool_size)
+        # featuremap_num_elems = \
+        #     input_shape_chw[1] * input_shape_chw[2] * featuremap_depth // \
+        #     (maxpool_size * maxpool_size)
+        # self._head = nn.Linear(featuremap_num_elems, 2)
 
         self._loss = nn.MSELoss(reduction='sum')
         # self._loss = nn.L1Loss(reduction='sum')
@@ -154,10 +263,15 @@ class Net(nn.Module):
     def forward(self, image_tensor_batch: torch.Tensor):
         assert len(image_tensor_batch.size()) >= 3
         featuremap = self._net(image_tensor_batch)
+
         # pred = Decoder().forward(featuremap)
-        featuremap_mp = self.maxpool(featuremap)
-        featuremap_flat = featuremap_mp.view(featuremap_mp.size(0), -1)
-        pred = self._head(featuremap_flat)
+
+        # featuremap_mp = self.maxpool(featuremap)
+        # featuremap_flat = featuremap_mp.view(featuremap_mp.size(0), -1)
+        # pred = self._head(featuremap_flat)
+
+        pred = DecoderUNet().forward(featuremap)
+
         return pred
 
     def loss(self, pred: torch.Tensor, anno: torch.Tensor):
@@ -186,7 +300,7 @@ class Trainer:
         num_epochs = 10000
         num_samples_in_epoch = 1000
 
-        optimizer = torch.optim.SGD(self._net.parameters(), lr=0.001)
+        optimizer = torch.optim.SGD(self._net.parameters(), lr=0.01)
 
         self.validate()
 
@@ -243,4 +357,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
