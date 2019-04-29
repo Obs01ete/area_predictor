@@ -265,8 +265,8 @@ class UNet(nn.Module):
             # print("upscale_out=", t.size())
             shortcut = branch_list[-i_block - 1]
             # print("shortcut=", shortcut.size())
-            # concat = torch.cat((t, shortcut), dim=1)
-            concat = torch.cat((t, t), dim=1)  ### DIRTY HACK
+            concat = torch.cat((t, shortcut), dim=1)
+            # concat = torch.cat((t, t), dim=1) ### DIRTY HACK
             # print("concat=", concat.size())
             t = fusion(concat)
             # print("fusion=", t.size())
@@ -287,23 +287,6 @@ class Prediction:
         self.segmentation = segmentation
 
 
-class FullConnectedRegressor(nn.Module):
-    def __init__(self, featuremap_num_elems):
-        super().__init__()
-
-        inner = 64
-        self._linear1 = nn.Linear(featuremap_num_elems, inner)
-        self._relu1 = nn.ReLU()
-        self._linear2 = nn.Linear(inner, 4)
-
-    def forward(self, t):
-        t = t.view(t.size(0), -1)
-        t = self._linear1(t)
-        t = self._relu1(t)
-        t = self._linear2(t)
-        return t
-
-
 class Net(nn.Module):
     def __init__(self, input_shape_chw):
         super().__init__()
@@ -313,37 +296,26 @@ class Net(nn.Module):
         featuremap_depth = 1  # 2 # 1  # 4
         self._net = UNet(input_shape_chw, featuremap_depth)
 
-        # featuremap_num_elems = \
-        #    input_shape_chw[1] * input_shape_chw[2] * featuremap_depth
-        # self._fc_regressor = FullConnectedRegressor(featuremap_num_elems)
-
-        # self._reg_loss = nn.MSELoss(reduction='sum')
-
         # self._seg_loss = nn.modules.loss.MSELoss()
-        # self._seg_loss = nn.modules.loss.BCELoss()
-        self._seg_loss = nn.modules.loss.BCEWithLogitsLoss()
+        self._seg_loss = nn.modules.loss.BCELoss()
+        # self._seg_loss = nn.modules.loss.BCEWithLogitsLoss()
 
     def forward(self, image_tensor_batch: torch.Tensor):
         assert len(list(image_tensor_batch.size())) >= 3
         featuremap_logits = self._net(image_tensor_batch)
         featuremap_logits = featuremap_logits.squeeze(1)
-        # featuremap = torch.sigmoid(featuremap_logits)
+        featuremap = torch.sigmoid(featuremap_logits)
         # regression = self._fc_regressor(featuremap_logits)
-        pred = Prediction(None, featuremap_logits)
+        pred = Prediction(None, featuremap)
         return pred
 
     def decode(self, prediction: Prediction):
-        logits = prediction.segmentation
-        decoded = torch.sigmoid(logits)
+        # logits = prediction.segmentation
+        # decoded = torch.sigmoid(logits)
+        decoded = prediction.segmentation
         return decoded
 
-    def loss(self, pred: Prediction, anno: torch.Tensor, segmentation_gt: torch.Tensor):
-        # if anno is not None:
-        #    assert len(pred.regression.size()) >= len(anno.size())
-        #    assert anno.size()[-1] >= 2
-        #    pred_reg = pred.regression[:, :anno.size()[-1]]
-        #    reg_loss = self._reg_loss(pred_reg, anno)
-
+    def loss(self, pred: Prediction, segmentation_gt: torch.Tensor):
         if segmentation_gt is not None:
             segmentation_loss = self._seg_loss(
                 # pred.segmentation,
@@ -354,10 +326,8 @@ class Net(nn.Module):
         else:
             segmentation_loss = torch.zeros((1), dtype=torch.float32)
 
-        # total_loss = reg_loss + segmentation_loss
         total_loss = segmentation_loss
         details = {
-            # "reg_loss": reg_loss.detach().cpu().item(),
             "seg_loss": segmentation_loss.detach().cpu().item()
         }
         return total_loss, details
@@ -377,10 +347,10 @@ class Trainer:
         if self.use_gpu:
             self._net.cuda()
 
-        import torchsummary
-        shape_chw = tuple(dataset.get_image_shape())
-        print("shape_chw=", shape_chw)
-        torchsummary.summary(self._net, input_size=shape_chw)
+        # import torchsummary
+        # shape_chw = tuple(dataset.get_image_shape())
+        # print("shape_chw=", shape_chw)
+        # torchsummary.summary(self._net, input_size=shape_chw)
         pass
 
     def train(self):
@@ -431,7 +401,7 @@ class Trainer:
                 pred = self._net.forward(batch.image_tensor)
                 decoded_segmentation = self._net.decode(pred)
                 loss, details = self._net.loss(
-                    pred, batch.anno_hw_frac_tensor, batch.segmentation_tensor)
+                    pred, batch.segmentation_tensor)
                 if batch_index % 10 == 0:
                     print("loss={:.4f} details={}".format(  # pred={} gt={}
                         loss.item(), details
@@ -442,6 +412,7 @@ class Trainer:
                         decoded_segmentation.detach().cpu().numpy()[0],
                         batch.segmentation_tensor.detach().cpu().numpy()[0],
                         batch.image_tensor.detach().cpu().numpy()[0].transpose((1, 2, 0)))
+                    print("-------------------------------")
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
@@ -460,7 +431,7 @@ class Trainer:
             sample.batchify()
 
             pred = self._net.forward(sample.image_tensor)
-            loss, details = self._net.loss(pred, sample.anno_hw_frac_tensor, sample.segmentation_tensor)
+            loss, details = self._net.loss(pred, sample.segmentation_tensor)
             if sample_idx % 3 == 0:
                 print("loss={:.4f} details={}".format(  # pred={} gt={}
                     loss.item(), details
@@ -474,11 +445,13 @@ class Trainer:
         # % matplotlib inline
         # import matplotlib.pyplot as plt
         #
+        # print("pred_mean={} gt_mean={}".format(pred.mean(), gt.mean()))
+        #
         # fig = plt.figure(figsize=(10, 3))
         # fig.add_subplot(1, 3, 1)
-        # plt.imshow(pred, cmap='gray')
+        # plt.imshow(pred, cmap='gray', vmin=0.0, vmax=1.0)
         # fig.add_subplot(1, 3, 2)
-        # plt.imshow(gt, cmap='gray')
+        # plt.imshow(gt, cmap='gray', vmin=0.0, vmax=1.0)
         # fig.add_subplot(1, 3, 3)
         # plt.imshow(input_image, vmin=0.0, vmax=1.0)
         #
