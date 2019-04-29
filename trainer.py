@@ -24,16 +24,33 @@ class Sample:
         self.segmentation_tensor = segmentation_tensor
 
     def cuda(self):
-        self.image_tensor = self.image_tensor.cuda()
-        self.anno_hw_frac_tensor = self.anno_hw_frac_tensor.cuda()
+        if self.image_tensor is not None:
+            self.image_tensor = self.image_tensor.cuda()
+        if self.anno_hw_frac_tensor is not None:
+            self.anno_hw_frac_tensor = self.anno_hw_frac_tensor.cuda()
         if self.segmentation_tensor is not None:
             self.segmentation_tensor = self.segmentation_tensor.cuda()
 
     def batchify(self):
-        self.image_tensor = self.image_tensor.unsqueeze(dim=0)
-        self.anno_hw_frac_tensor = self.anno_hw_frac_tensor.unsqueeze(dim=0)
+        if self.image_tensor is not None:
+            self.image_tensor = self.image_tensor.unsqueeze(dim=0)
+        if self.anno_hw_frac_tensor is not None:
+            self.anno_hw_frac_tensor = self.anno_hw_frac_tensor.unsqueeze(dim=0)
         if self.segmentation_tensor is not None:
             self.segmentation_tensor = self.segmentation_tensor.unsqueeze(dim=0)
+
+    @staticmethod
+    def collate(batch_list):
+        image_tensor = torch.stack([t.image_tensor for t in batch_list], dim=0)
+        segmentation_tensor = torch.stack([t.segmentation_tensor for t in batch_list], dim=0)
+        batch_sample = Sample(
+            None,
+            None,
+            "i_am_batchman",
+            image_tensor,
+            None,
+            segmentation_tensor=segmentation_tensor)
+        return batch_sample
 
 
 class Dataset:
@@ -94,7 +111,6 @@ class SyntheticDataset:
 
         h, w = self._image_shape_chw[1:]
 
-        # TODO fill
         color_bg = np.random.randint(256, size=3)
         color_fg = np.random.randint(256, size=3)
         color_bg = np.reshape(color_bg, (-1, 1, 1))
@@ -112,13 +128,6 @@ class SyntheticDataset:
         anno_hwyx_tensor[1] = (right - left) / w
         anno_hwyx_tensor[2] = (bottom + top) / (2 * h)
         anno_hwyx_tensor[3] = (right + left) / (2 * w)
-
-        #         image_hwc = np.transpose(image_tensor_chw, (1, 2, 0))
-        #         plt.figure()
-        #         plt.imshow(image_hwc)
-        #         plt.figure()
-        #         plt.imshow(segmentation_tensor, cmap='gray')
-        #         assert False
 
         image_tensor_chw = torch.from_numpy(image_tensor_chw)
         segmentation_tensor = torch.from_numpy(segmentation_tensor)
@@ -182,17 +191,34 @@ class Deconv(nn.Module):
         return relu
 
 
+class Upscale(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        # self._upsample = nn.Upsample(scale_factor=2, mode='nearest')
+        # self._upsample = nn.UpsamplingNearest2d(scale_factor=2)
+        self._upsample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        self._conv = Conv(in_channels, out_channels, 1)
+        pass
+
+    def forward(self, input, **kwargs):
+        t = self._upsample(input)
+        t = self._conv(t)
+        return t
+
+
 class UNet(nn.Module):
     def __init__(self, input_shape_chw, featuremap_depth):
         super().__init__()
 
         self.input_shape_chw = input_shape_chw
 
-        ch = 4  # 8
+        ch = 16  # 8
         self._first_conv = Conv(input_shape_chw[0], ch, 3)
         branch_channels = [ch]
 
-        num_levels = min(8, int(math.log2(min(input_shape_chw[1], input_shape_chw[2]))))
+        max_levels = 4  # 6
+        num_levels = min(max_levels,
+                         int(math.log2(min(input_shape_chw[1], input_shape_chw[2]))))
         downscale_list = nn.ModuleList()
         for _ in range(num_levels):
             conv1 = Conv(ch, ch, 3)
@@ -202,12 +228,19 @@ class UNet(nn.Module):
             ch = ch * 2
         self._downscale_blocks = downscale_list
 
+        print("branch_channels=", branch_channels)
+
         upscale_list = nn.ModuleList()
+        fusion_list = nn.ModuleList()
         for _ in range(num_levels):
-            deconv = Deconv(ch, ch // 2, 3, stride=2)
+            # deconv = Deconv(ch, ch // 2, 3, stride=2)
+            deconv = Upscale(ch, ch // 2)
             upscale_list.append(deconv)
+            fusion = Conv(ch, ch // 2, 1)
+            fusion_list.append(fusion)
             ch = ch // 2
         self._upscale_blocks = upscale_list
+        self._fusion_blocks = fusion_list
 
         self._out_conv = Conv(ch, featuremap_depth, 1, has_relu=False)
 
@@ -215,20 +248,35 @@ class UNet(nn.Module):
 
     def forward(self, input):
         t = self._first_conv(input)
+        # print("first_conv=", t.size())
         branch_list = [t]
         for block in self._downscale_blocks:
             t = block(t)
+            # print("downscale_out=", t.size())
             branch_list.append(t)
 
         branch_list = branch_list[:-1]
+        # for branch in branch_list:
+        #    print("branch=", branch.size())
 
-        for i_block, block in enumerate(self._upscale_blocks):
+        for i_block, (upscale, fusion) in enumerate(zip(self._upscale_blocks, self._fusion_blocks)):
             upscaled_size = torch.Size((t.size()[2] * 2, t.size()[3] * 2))
-            t = block(t, output_size=upscaled_size)
-            t = t + branch_list[-i_block - 1]
+            t = upscale(t, output_size=upscaled_size)
+            # print("upscale_out=", t.size())
+            shortcut = branch_list[-i_block - 1]
+            # print("shortcut=", shortcut.size())
+            # concat = torch.cat((t, shortcut), dim=1)
+            concat = torch.cat((t, t), dim=1)  ### DIRTY HACK
+            # print("concat=", concat.size())
+            t = fusion(concat)
+            # print("fusion=", t.size())
             pass
 
         t = self._out_conv(t)
+
+        # print("out_conv=", t.size())
+
+        # assert False
 
         return t
 
@@ -265,32 +313,47 @@ class Net(nn.Module):
         featuremap_depth = 1  # 2 # 1  # 4
         self._net = UNet(input_shape_chw, featuremap_depth)
 
-        featuremap_num_elems = \
-            input_shape_chw[1] * input_shape_chw[2] * featuremap_depth
-        self._fc_regressor = FullConnectedRegressor(featuremap_num_elems)
+        # featuremap_num_elems = \
+        #    input_shape_chw[1] * input_shape_chw[2] * featuremap_depth
+        # self._fc_regressor = FullConnectedRegressor(featuremap_num_elems)
 
-        self._reg_loss = nn.MSELoss(reduction='sum')
+        # self._reg_loss = nn.MSELoss(reduction='sum')
 
-        # self._seg_loss = nn.modules.loss.BCEWithLogitsLoss()
-        self._seg_loss = nn.modules.loss.MSELoss()
+        # self._seg_loss = nn.modules.loss.MSELoss()
+        # self._seg_loss = nn.modules.loss.BCELoss()
+        self._seg_loss = nn.modules.loss.BCEWithLogitsLoss()
 
     def forward(self, image_tensor_batch: torch.Tensor):
         assert len(list(image_tensor_batch.size())) >= 3
         featuremap_logits = self._net(image_tensor_batch)
-        featuremap = torch.sigmoid(featuremap_logits)
-        regression = self._fc_regressor(featuremap)
-        pred = Prediction(regression, featuremap)
+        featuremap_logits = featuremap_logits.squeeze(1)
+        # featuremap = torch.sigmoid(featuremap_logits)
+        # regression = self._fc_regressor(featuremap_logits)
+        pred = Prediction(None, featuremap_logits)
         return pred
 
+    def decode(self, prediction: Prediction):
+        logits = prediction.segmentation
+        decoded = torch.sigmoid(logits)
+        return decoded
+
     def loss(self, pred: Prediction, anno: torch.Tensor, segmentation_gt: torch.Tensor):
-        assert len(pred.regression.size()) >= len(anno.size())
-        assert anno.size()[-1] >= 2
-        pred_reg = pred.regression[:, :anno.size()[-1]]
-        reg_loss = self._reg_loss(pred_reg, anno)
+        # if anno is not None:
+        #    assert len(pred.regression.size()) >= len(anno.size())
+        #    assert anno.size()[-1] >= 2
+        #    pred_reg = pred.regression[:, :anno.size()[-1]]
+        #    reg_loss = self._reg_loss(pred_reg, anno)
+
         if segmentation_gt is not None:
-            segmentation_loss = self._seg_loss(pred.segmentation, segmentation_gt.unsqueeze(0))
+            segmentation_loss = self._seg_loss(
+                # pred.segmentation,
+                # segmentation_gt
+                pred.segmentation.view(-1),
+                segmentation_gt.view(-1)
+            )
         else:
             segmentation_loss = torch.zeros((1), dtype=torch.float32)
+
         # total_loss = reg_loss + segmentation_loss
         total_loss = segmentation_loss
         details = {
@@ -314,39 +377,75 @@ class Trainer:
         if self.use_gpu:
             self._net.cuda()
 
+        import torchsummary
+        shape_chw = tuple(dataset.get_image_shape())
+        print("shape_chw=", shape_chw)
+        torchsummary.summary(self._net, input_size=shape_chw)
+        pass
+
     def train(self):
         num_epochs = 10000
-        num_samples_in_epoch = 1000
+        num_samples_in_epoch = 1024 * 16
+
+        batch_size = 32
 
         optimizer = torch.optim.SGD(self._net.parameters(), lr=0.01)
 
         self.validate()
 
+        #         def batch_collator(sample_gen, batch_size):
+        #             batch_list = []
+        #             for sample in sample_gen:
+        #                 batch_list.append(sample)
+        #                 if len(batch_list) == batch_size:
+        #                     batch = Sample.collate(batch_list)
+        #                     yield batch
+
         for epoch in range(num_epochs):
             print("Epoch --- ", epoch)
+
             train_gen = self._split.train_gen(num_samples_in_epoch)
+
+            # train_collator_gen = batch_collator(train_gen, batch_size)
+
+            batch_list = []
+            batch_index = 0
             for sample_idx, sample in enumerate(train_gen):
-                # print(sample.name, sample.image.shape, sample.anno_hw,
-                #       sample.image_tensor.size(), sample.anno_hw_frac_tensor)
+
+                if len(batch_list) < batch_size:
+                    batch_list.append(sample)
+                    # print("append")
+                    continue
+
+                # print("process ----")
+                batch = Sample.collate(batch_list)
+                batch_list = []
+                batch_index = batch_index + 1
+
+                # print(batch.image_tensor.size())
 
                 if self.use_gpu:
-                    sample.cuda()
-                sample.batchify()
+                    batch.cuda()
+                # sample.batchify()
 
-                pred = self._net.forward(sample.image_tensor)
+                pred = self._net.forward(batch.image_tensor)
+                decoded_segmentation = self._net.decode(pred)
                 loss, details = self._net.loss(
-                    pred, sample.anno_hw_frac_tensor, sample.segmentation_tensor)
-                if sample_idx % 250 == 0:
-                    print("loss={:.4f} details={} pred={} gt={}".format(
-                        loss.item(), details, pred.regression.detach().cpu().numpy(),
-                        sample.anno_hw_frac_tensor.cpu().numpy()))
+                    pred, batch.anno_hw_frac_tensor, batch.segmentation_tensor)
+                if batch_index % 10 == 0:
+                    print("loss={:.4f} details={}".format(  # pred={} gt={}
+                        loss.item(), details
+                        # pred.regression.detach().cpu().numpy(),
+                        # batch.anno_hw_frac_tensor.cpu().numpy()
+                    ))
                     self._render_prediction(
-                        pred.segmentation.detach().cpu().numpy().squeeze(0).squeeze(0),
-                        sample.segmentation_tensor.detach().cpu().numpy().squeeze(0),
-                        sample.image_tensor.detach().cpu().numpy().squeeze(0).transpose((1, 2, 0)))
+                        decoded_segmentation.detach().cpu().numpy()[0],
+                        batch.segmentation_tensor.detach().cpu().numpy()[0],
+                        batch.image_tensor.detach().cpu().numpy()[0].transpose((1, 2, 0)))
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
+
                 pass
 
             self.validate()
@@ -363,10 +462,11 @@ class Trainer:
             pred = self._net.forward(sample.image_tensor)
             loss, details = self._net.loss(pred, sample.anno_hw_frac_tensor, sample.segmentation_tensor)
             if sample_idx % 3 == 0:
-                print("loss={:.4f} details={} pred={} gt={}".format(
-                    loss.item(), details,
-                    pred.regression.detach().cpu().numpy(),
-                    sample.anno_hw_frac_tensor.cpu().numpy()))
+                print("loss={:.4f} details={}".format(  # pred={} gt={}
+                    loss.item(), details
+                    # pred.regression.detach().cpu().numpy(),
+                    # sample.anno_hw_frac_tensor.cpu().numpy()
+                ))
 
         pass
 
@@ -374,10 +474,7 @@ class Trainer:
         # % matplotlib inline
         # import matplotlib.pyplot as plt
         #
-        # # print(pred.shape)
-        # # print(gt.shape)
-        #
-        # fig = plt.figure()
+        # fig = plt.figure(figsize=(10, 3))
         # fig.add_subplot(1, 3, 1)
         # plt.imshow(pred, cmap='gray')
         # fig.add_subplot(1, 3, 2)
@@ -398,6 +495,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
