@@ -484,12 +484,14 @@ class Trainer:
         pass
 
     def train(self):
-        num_epochs = 50  # 20 epochs for 32x32 model
+        num_epochs = 40
         batch_size = 16
         batches_per_epoch = 1024
-        learning_rate = 0.05
+        learning_rate = 0.02
 
         optimizer = torch.optim.SGD(self._net.parameters(), lr=learning_rate)
+        scheduler = torch.optim.lr_scheduler.MultiStepLR(
+            optimizer, [30, 35], gamma=0.1, last_epoch=-1)
 
         self.validate()
 
@@ -509,9 +511,8 @@ class Trainer:
                 loss, details = self._net.loss(pred, batch.segmentation_tensor)
 
                 if batch_index % 50 == 0:
-                    print("epoch={} batch={} loss={:.4f} details={}".format(
-                        epoch, batch_index,
-                        loss.item(), details
+                    print("epoch={} batch={} loss={:.4f}".format(
+                        epoch, batch_index, loss.item()
                     ))
                     self._render_prediction(
                         pred.detach().cpu().numpy()[0],
@@ -524,10 +525,17 @@ class Trainer:
                 optimizer.step()
                 pass
 
+            scheduler.step()
+
             torch.save(self._net.state_dict(), self._snapshot_name)
 
             self.validate()
-        pass
+
+            pass
+            # end of epoch
+
+        print("Train finished!")
+        # end of train()
 
     def validate(self):
         print("Validation")
@@ -558,9 +566,8 @@ class Trainer:
             relative_error_list.append(relative_error)
 
             if sample_idx % 20 == 0:
-                print(sample.anno_hw)
-                print("loss={:.4f} details={} gt_area={} pred_area={}".format(
-                    loss.item(), details, gt_area, pred_area
+                print("loss={:.4f} gt_area={} pred_area={}".format(
+                    loss.item(), gt_area, pred_area
                 ))
                 self._render_prediction(
                     pred.detach().cpu().numpy()[0],
@@ -569,16 +576,14 @@ class Trainer:
 
         average_relative_error = \
             np.array(relative_error_list).sum() / len(relative_error_list)
-        print("average_relative_error={:0.6f}".format(average_relative_error))
+        print("-------- Final metric -----------")
+        print("Average relative area error = {:0.6f}".format(average_relative_error))
 
         pass
 
     def _render_prediction(self, pred: np.ndarray, gt: np.ndarray, input_image: np.ndarray):
         # % matplotlib inline
         # import matplotlib.pyplot as plt
-        #
-        # print("pred_mean={} gt_mean={}".format(
-        #     pred.mean(), gt.mean() if gt is not None else float('nan')))
         #
         # fig = plt.figure(figsize=(10, 3))
         # fig.add_subplot(1, 3, 1)
@@ -595,7 +600,7 @@ class Trainer:
 
 
 def main():
-    if True:
+    if False:
         trainer = Trainer()
         trainer.train()
     else:
