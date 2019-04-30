@@ -8,53 +8,56 @@ import torch.nn.modules.loss
 import torch.nn.functional as F
 import numpy as np
 from PIL import Image
-from typing import Union
+from typing import Union, List
+import torchsummary
 
 
 class Sample:
     def __init__(
-            self, image: np.ndarray, anno_hw: np.ndarray, name: str,
-            image_tensor: torch.Tensor, anno_hw_frac_tensor: torch.Tensor,
-            segmentation_tensor: torch.Tensor = None):
+            self,
+            image: Union[np.ndarray, List[np.ndarray]],
+            anno_hw: Union[np.ndarray, List[np.ndarray]],
+            name: Union[str, List[str]],
+            image_tensor: torch.Tensor,
+            segmentation_tensor: torch.Tensor):
 
         self.image = image
         self.anno_hw = anno_hw
         self.name = name
         self.image_tensor = image_tensor
-        self.anno_hw_frac_tensor = anno_hw_frac_tensor  # may be in HWYX format
         self.segmentation_tensor = segmentation_tensor
 
     def cuda(self):
         if self.image_tensor is not None:
             self.image_tensor = self.image_tensor.cuda()
-        if self.anno_hw_frac_tensor is not None:
-            self.anno_hw_frac_tensor = self.anno_hw_frac_tensor.cuda()
         if self.segmentation_tensor is not None:
             self.segmentation_tensor = self.segmentation_tensor.cuda()
 
     def batchify(self):
         if self.image_tensor is not None:
             self.image_tensor = self.image_tensor.unsqueeze(dim=0)
-        if self.anno_hw_frac_tensor is not None:
-            self.anno_hw_frac_tensor = self.anno_hw_frac_tensor.unsqueeze(dim=0)
         if self.segmentation_tensor is not None:
             self.segmentation_tensor = self.segmentation_tensor.unsqueeze(dim=0)
 
     @staticmethod
     def collate(batch_list):
-        image_tensor = torch.stack([t.image_tensor for t in batch_list], dim=0)
-        segmentation_tensor = torch.stack([t.segmentation_tensor for t in batch_list], dim=0)
+        images = [t.image for t in batch_list]
+        annos = [t.anno_hw for t in batch_list]
+        image_tensor = torch.stack(
+            [t.image_tensor for t in batch_list], dim=0)
+        segmentation_tensor = torch.stack(
+            [t.segmentation_tensor for t in batch_list], dim=0)
+        names = [t.name for t in batch_list]
         batch_sample = Sample(
-            None,
-            None,
-            "i_am_batchman",
+            images,
+            annos,
+            names,
             image_tensor,
-            None,
-            segmentation_tensor=segmentation_tensor)
+            segmentation_tensor)
         return batch_sample
 
 
-class Dataset:
+class CustomDataset:
     def __init__(self, folder):
         self._ext = ".png"
         self._folder = folder
@@ -67,26 +70,15 @@ class Dataset:
     def get_list(self):
         return self._name_list
 
-    def get_item(self, item, do_augmentation=False):
+    def get_item(self, item):
         path = os.path.join(self._folder, item + self._ext)
         image_pil = Image.open(path)
         image_hwc = np.asarray(image_pil)
-        alpha = image_hwc[:, :, 3]
-        red = image_hwc[:, :, 0]
-        image_hwc = image_hwc[:, :, :3]  # throw away alpha channel
-        if do_augmentation:
-            rand_h, rand_w = np.random.randint(2, size=2)
-            if rand_h > 0:
-                image_hwc = np.flip(image_hwc, axis=0)
-            if rand_w > 0:
-                image_hwc = np.flip(image_hwc, axis=1)
-        # print(image_hwc.shape)
+        image_hwc = image_hwc[:, :, :3] # throw away alpha channel
         anno_hw = self._parse_name(item)
         image_chw = np.transpose(image_hwc, (2, 0, 1)) / 255.0
         image_tensor_chw = torch.from_numpy(image_chw).type(torch.float32)
-        anno_hw_frac = anno_hw / np.array(image_chw.shape[1:])
-        anno_hw_tensor = torch.from_numpy(anno_hw_frac).type(torch.float32)
-        return Sample(image_hwc, anno_hw, item, image_tensor_chw, anno_hw_tensor)
+        return Sample(image_hwc, anno_hw, item, image_tensor_chw, None)
 
     def _parse_name(self, name: str) -> Union[np.ndarray, None]:
         word_list = name.split("_")
@@ -107,9 +99,9 @@ class SyntheticDataset:
         self._image_shape_chw = image_shape_chw
 
     def generate(self):
-        image_tensor_chw = np.zeros(self._image_shape_chw, dtype=np.float32)
+        image_chw = np.zeros(self._image_shape_chw, dtype=np.float32)
         segmentation_tensor = np.zeros(self._image_shape_chw[1:], dtype=np.float32)
-        anno_hwyx_tensor = np.zeros(4, dtype=np.float32)
+        anno_hw = np.zeros(4, dtype=np.int)
 
         h, w = self._image_shape_chw[1:]
 
@@ -128,184 +120,69 @@ class SyntheticDataset:
                 continue
             break
 
-        image_tensor_chw[...] = color_bg
-        image_tensor_chw[:, top:bottom, left:right] = color_fg
-        image_tensor_chw = image_tensor_chw / 255
+        image_chw[...] = color_bg
+        image_chw[:, top:bottom, left:right] = color_fg
 
         segmentation_tensor[top:bottom, left:right] = 1.0
 
-        anno_hwyx_tensor[0] = (bottom - top) / h
-        anno_hwyx_tensor[1] = (right - left) / w
-        anno_hwyx_tensor[2] = (bottom + top) / (2 * h)
-        anno_hwyx_tensor[3] = (right + left) / (2 * w)
+        anno_hw[0] = bottom - top
+        anno_hw[1] = right - left
 
-        image_tensor_chw = torch.from_numpy(image_tensor_chw)
+        image_float_chw = image_chw / 255
+        image_hwc = np.transpose(image_chw, (1, 2, 0))
+        image_tensor_chw = torch.from_numpy(image_float_chw)
         segmentation_tensor = torch.from_numpy(segmentation_tensor)
-        anno_hwyx_tensor = torch.from_numpy(anno_hwyx_tensor)
 
-        return Sample(None, None, "generated", image_tensor_chw, anno_hwyx_tensor,
-                      segmentation_tensor=segmentation_tensor)
+        return Sample(image_hwc, anno_hw, "synthetic", image_tensor_chw,
+                      segmentation_tensor)
 
 
-class Split:
-    def __init__(self,
-                 dataset: Dataset,
-                 val_frac: float,
-                 synthetic_train: bool = False,
-                 # synthetic_shape = (3, 256, 256)
-                 synthetic_shape=(3, 32, 32)
-                 ):
-        self._dataset = dataset
-        if synthetic_train:
-            self._image_shape = synthetic_shape
-            self._synthetic_dataset = SyntheticDataset(self._image_shape)
-        else:
-            self._image_shape = dataset.get_image_shape()
-            self._synthetic_dataset = None
-        all_names = self._dataset.get_list()
-        num_val = int(val_frac * len(all_names))
-        self._train_names = all_names[num_val:]
-        print("Train size =", len(self._train_names))
-        self._val_names = all_names[:num_val]
-        print("Val size =", len(self._val_names))
+class DatasetDispatcher:
+    def __init__(
+            self,
+             # work_shape = (3, 256, 256)
+             work_shape = (3, 32, 32)  # converges!
+             # work_shape = (3, 64, 64) # converges pretty fast
+             #work_shape=(3, 128, 128)  # converges too slowly
+             ):
 
-    def train_gen(self, num_samples_in_epoch):
-        for i in range(num_samples_in_epoch):
-            if self._synthetic_dataset is not None:
-                yield self._synthetic_dataset.generate()
-            else:
-                index = i % len(self._train_names)
-                name = self._train_names[index]
-                yield self._dataset.get_item(name, do_augmentation=True)
+        self._custom_dataset = CustomDataset("data/")
+        self._image_shape = work_shape
+        self._synthetic_dataset = SyntheticDataset(self._image_shape)
+        self._val_names = self._custom_dataset.get_list()
+        print("Custom dataset size =", len(self._val_names))
+
+    def _tensor_custom_to_work_reso(self, tensor):
+        tensor = F.interpolate(
+            tensor.unsqueeze(0),
+            size=self._image_shape[1:],
+            mode='nearest').squeeze(0)
+        return tensor
+
+    def tensor_work_to_custom(self, tensor):
+        tensor = F.interpolate(
+            tensor.unsqueeze(0),
+            size=self._custom_dataset.get_image_shape()[1:],
+            mode='nearest').squeeze(0)
+        return tensor
+
+    def train_gen(self, batches_per_epoch, batch_size):
+        for i in range(batches_per_epoch):
+            sample_list = []
+            for ib in range(batch_size):
+                sample = self._synthetic_dataset.generate()
+                sample_list.append(sample)
+            batch = Sample.collate(sample_list)
+            yield batch
 
     def val_gen(self):
-        if self._synthetic_dataset is not None:
-            for i in range(10):
-                yield self._synthetic_dataset.generate()
-        else:
-            for name in self._val_names:
-                yield self._dataset.get_item(name)
+        for name in self._val_names:
+            sample = self._custom_dataset.get_item(name)
+            sample.image_tensor = self._tensor_custom_to_work_reso(sample.image_tensor)
+            yield sample
 
     def get_image_shape(self):
         return self._image_shape
-
-
-class Conv(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size, stride=1, has_relu=True):
-        super().__init__()
-        self._conv = nn.Conv2d(
-            in_channels, out_channels, kernel_size,
-            padding=(kernel_size - 1) // 2, stride=stride)
-        self._relu = nn.ReLU() if has_relu else None
-
-    def forward(self, input):
-        conv = self._conv(input)
-        relu = self._relu(conv) if self._relu is not None else conv
-        return relu
-
-
-class Deconv(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size, stride=1, has_relu=True):
-        super().__init__()
-        self._conv = nn.ConvTranspose2d(
-            in_channels, out_channels, kernel_size,
-            padding=(kernel_size - 1) // 2, stride=stride)
-        self._relu = nn.ReLU() if has_relu else None
-
-    def forward(self, input, **kwargs):
-        conv = self._conv(input, **kwargs)
-        relu = self._relu(conv) if self._relu is not None else conv
-        return relu
-
-
-class Upscale(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-        # self._upsample = nn.Upsample(scale_factor=2, mode='nearest')
-        # self._upsample = nn.UpsamplingNearest2d(scale_factor=2)
-        self._upsample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        self._conv = Conv(in_channels, out_channels, 1)
-        pass
-
-    def forward(self, input, **kwargs):
-        t = self._upsample(input)
-        t = self._conv(t)
-        return t
-
-
-class UNet(nn.Module):
-    def __init__(self, input_shape_chw, featuremap_depth):
-        super().__init__()
-
-        self.input_shape_chw = input_shape_chw
-
-        ch = 16  # 8
-        self._first_conv = Conv(input_shape_chw[0], ch, 3)
-        branch_channels = [ch]
-
-        max_levels = 4  # 6
-        num_levels = min(max_levels,
-                         int(math.log2(min(input_shape_chw[1], input_shape_chw[2]))))
-        downscale_list = nn.ModuleList()
-        for _ in range(num_levels):
-            conv1 = Conv(ch, ch, 3)
-            conv2 = Conv(ch, ch * 2, 3, stride=2)
-            downscale_list.append(nn.Sequential(conv1, conv2))
-            branch_channels.append(ch)
-            ch = ch * 2
-        self._downscale_blocks = downscale_list
-
-        print("branch_channels=", branch_channels)
-
-        upscale_list = nn.ModuleList()
-        fusion_list = nn.ModuleList()
-        for _ in range(num_levels):
-            # deconv = Deconv(ch, ch // 2, 3, stride=2)
-            deconv = Upscale(ch, ch // 2)
-            upscale_list.append(deconv)
-            fusion = Conv(ch, ch // 2, 1)
-            fusion_list.append(fusion)
-            ch = ch // 2
-        self._upscale_blocks = upscale_list
-        self._fusion_blocks = fusion_list
-
-        self._out_conv = Conv(ch, featuremap_depth, 1, has_relu=False)
-
-        pass
-
-    def forward(self, input):
-        t = self._first_conv(input)
-        # print("first_conv=", t.size())
-        branch_list = [t]
-        for block in self._downscale_blocks:
-            t = block(t)
-            # print("downscale_out=", t.size())
-            branch_list.append(t)
-
-        branch_list = branch_list[:-1]
-        # for branch in branch_list:
-        #    print("branch=", branch.size())
-
-        for i_block, (upscale, fusion) in enumerate(zip(self._upscale_blocks, self._fusion_blocks)):
-            upscaled_size = torch.Size((t.size()[2] * 2, t.size()[3] * 2))
-            t = upscale(t, output_size=upscaled_size)
-            # print("upscale_out=", t.size())
-            shortcut = branch_list[-i_block - 1]
-            # print("shortcut=", shortcut.size())
-            concat = torch.cat((t, shortcut), dim=1)
-            # concat = torch.cat((t, t), dim=1) ### DIRTY HACK
-            # print("concat=", concat.size())
-            t = fusion(concat)
-            # print("fusion=", t.size())
-            pass
-
-        t = self._out_conv(t)
-
-        # print("out_conv=", t.size())
-
-        # assert False
-
-        return t
 
 
 def conv1x1(in_channels, out_channels, groups=1):
@@ -536,12 +413,6 @@ class UNet3rdParty(nn.Module):
         return x
 
 
-class Prediction:
-    def __init__(self, regression: torch.Tensor, segmentation: torch.Tensor):
-        self.regression = regression
-        self.segmentation = segmentation
-
-
 class Net(nn.Module):
     def __init__(self, input_shape_chw):
         super().__init__()
@@ -556,9 +427,11 @@ class Net(nn.Module):
         )
         print("num_levels=", num_levels)
 
+        start_filts = 8  # 16
+
         # self._net = UNet(input_shape_chw, featuremap_depth)
         self._net = UNet3rdParty(featuremap_depth, input_shape_chw[0],
-                                 start_filts=16, depth=num_levels)  # 32
+                                 start_filts=start_filts, depth=num_levels)
 
         # self._seg_loss = nn.modules.loss.MSELoss()
         self._seg_loss = nn.modules.loss.BCELoss()
@@ -566,29 +439,19 @@ class Net(nn.Module):
 
     def forward(self, image_tensor_batch: torch.Tensor):
         assert len(list(image_tensor_batch.size())) >= 3
-        featuremap_logits = self._net(image_tensor_batch)
-        featuremap_logits = featuremap_logits.squeeze(1)
-        featuremap = torch.sigmoid(featuremap_logits)
-        # regression = self._fc_regressor(featuremap_logits)
-        pred = Prediction(None, featuremap)
+        logits = self._net(image_tensor_batch)
+        logits = logits.squeeze(1)
+        pred = torch.sigmoid(logits)
         return pred
 
-    def decode(self, prediction: Prediction):
-        # logits = prediction.segmentation
-        # decoded = torch.sigmoid(logits)
-        decoded = prediction.segmentation
-        return decoded
-
-    def loss(self, pred: Prediction, segmentation_gt: torch.Tensor):
+    def loss(self, pred: torch.Tensor, segmentation_gt: torch.Tensor):
         if segmentation_gt is not None:
             segmentation_loss = self._seg_loss(
-                # pred.segmentation,
-                # segmentation_gt
-                pred.segmentation.view(-1),
+                pred.view(-1),
                 segmentation_gt.view(-1)
             )
         else:
-            segmentation_loss = torch.zeros((1), dtype=torch.float32)
+            segmentation_loss = torch.zeros((1,), dtype=torch.float32)
 
         total_loss = segmentation_loss
         details = {
@@ -598,92 +461,70 @@ class Net(nn.Module):
 
 
 class Trainer:
-    def __init__(self):
+    def __init__(self, load_last_snapshot=False):
         has_gpu = torch.cuda.device_count() > 0
         if has_gpu:
             print(torch.cuda.get_device_name(0))
         else:
             print("GPU not found")
         self.use_gpu = has_gpu
-        dataset = Dataset("data/")
-        self._split = Split(dataset, 0.1, synthetic_train=True)
-        self._net = Net(self._split.get_image_shape())
+
+        self._dispatcher = DatasetDispatcher()
+        self._net = Net(self._dispatcher.get_image_shape())
         if self.use_gpu:
             self._net.cuda()
 
-        # import torchsummary
-        # shape_chw = tuple(dataset.get_image_shape())
-        # print("shape_chw=", shape_chw)
-        # torchsummary.summary(self._net, input_size=shape_chw)
+        self._snapshot_name = "snapshot.pth"
+        if load_last_snapshot:
+            self._net.load_state_dict(torch.load(self._snapshot_name))
+
+        shape_chw = tuple(self._dispatcher.get_image_shape())
+        print("Work image shape =", shape_chw)
+        torchsummary.summary(self._net, input_size=shape_chw)
         pass
 
     def train(self):
-        num_epochs = 10000
-        num_samples_in_epoch = 1024 * 16
-
+        num_epochs = 50  # 20 epochs for 32x32 model
         batch_size = 16
+        batches_per_epoch = 1024
+        learning_rate = 0.05
 
-        optimizer = torch.optim.SGD(self._net.parameters(), lr=0.1)  # 0.01
+        optimizer = torch.optim.SGD(self._net.parameters(), lr=learning_rate)
 
         self.validate()
 
-        #         def batch_collator(sample_gen, batch_size):
-        #             batch_list = []
-        #             for sample in sample_gen:
-        #                 batch_list.append(sample)
-        #                 if len(batch_list) == batch_size:
-        #                     batch = Sample.collate(batch_list)
-        #                     yield batch
-
         for epoch in range(num_epochs):
-            print("Epoch --- ", epoch)
+            print("Epoch ------ ", epoch)
 
-            train_gen = self._split.train_gen(num_samples_in_epoch)
-
-            # train_collator_gen = batch_collator(train_gen, batch_size)
+            train_gen = self._dispatcher.train_gen(batches_per_epoch, batch_size)
 
             self._net.train()
 
-            batch_list = []
-            batch_index = 0
-            for sample_idx, sample in enumerate(train_gen):
-
-                if len(batch_list) < batch_size:
-                    batch_list.append(sample)
-                    # print("append")
-                    continue
-
-                # print("process ----")
-                batch = Sample.collate(batch_list)
-                batch_list = []
-                batch_index = batch_index + 1
-
-                # print(batch.image_tensor.size())
-
+            for batch_index, batch in enumerate(train_gen):
                 if self.use_gpu:
                     batch.cuda()
-                # sample.batchify()
 
                 pred = self._net.forward(batch.image_tensor)
-                decoded_segmentation = self._net.decode(pred)
-                loss, details = self._net.loss(
-                    pred, batch.segmentation_tensor)
-                if batch_index % 10 == 0:
-                    print("loss={:.4f} details={}".format(  # pred={} gt={}
+
+                loss, details = self._net.loss(pred, batch.segmentation_tensor)
+
+                if batch_index % 50 == 0:
+                    print("epoch={} batch={} loss={:.4f} details={}".format(
+                        epoch, batch_index,
                         loss.item(), details
-                        # pred.regression.detach().cpu().numpy(),
-                        # batch.anno_hw_frac_tensor.cpu().numpy()
                     ))
                     self._render_prediction(
-                        decoded_segmentation.detach().cpu().numpy()[0],
+                        pred.detach().cpu().numpy()[0],
                         batch.segmentation_tensor.detach().cpu().numpy()[0],
                         batch.image_tensor.detach().cpu().numpy()[0].transpose((1, 2, 0)))
                     print("-------------------------------")
+
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
-
                 pass
+
+            torch.save(self._net.state_dict(), self._snapshot_name)
 
             self.validate()
         pass
@@ -693,7 +534,9 @@ class Trainer:
 
         self._net.eval()
 
-        val_gen = self._split.val_gen()
+        val_gen = self._dispatcher.val_gen()
+        relative_error_list = []
+
         for sample_idx, sample in enumerate(val_gen):
             if self.use_gpu:
                 sample.cuda()
@@ -701,12 +544,32 @@ class Trainer:
 
             pred = self._net.forward(sample.image_tensor)
             loss, details = self._net.loss(pred, sample.segmentation_tensor)
-            if sample_idx % 3 == 0:
-                print("loss={:.4f} details={}".format(  # pred={} gt={}
-                    loss.item(), details
-                    # pred.regression.detach().cpu().numpy(),
-                    # sample.anno_hw_frac_tensor.cpu().numpy()
+
+            def decode_prediction(pred: torch.Tensor) -> np.ndarray:
+                pred_custom_res = self._dispatcher.tensor_work_to_custom(pred)
+                mask = pred_custom_res > 0.5
+                area = mask.sum()
+                return area.detach().cpu().item()
+
+            pred_area = decode_prediction(pred)
+            anno_hw = sample.anno_hw
+            gt_area = anno_hw[0] * anno_hw[1]
+            relative_error = abs(pred_area - gt_area) / gt_area
+            relative_error_list.append(relative_error)
+
+            if sample_idx % 20 == 0:
+                print(sample.anno_hw)
+                print("loss={:.4f} details={} gt_area={} pred_area={}".format(
+                    loss.item(), details, gt_area, pred_area
                 ))
+                self._render_prediction(
+                    pred.detach().cpu().numpy()[0],
+                    None,
+                    sample.image_tensor.detach().cpu().numpy()[0].transpose((1, 2, 0)))
+
+        average_relative_error = \
+            np.array(relative_error_list).sum() / len(relative_error_list)
+        print("average_relative_error={:0.6f}".format(average_relative_error))
 
         pass
 
@@ -714,13 +577,15 @@ class Trainer:
         # % matplotlib inline
         # import matplotlib.pyplot as plt
         #
-        # print("pred_mean={} gt_mean={}".format(pred.mean(), gt.mean()))
+        # print("pred_mean={} gt_mean={}".format(
+        #     pred.mean(), gt.mean() if gt is not None else float('nan')))
         #
         # fig = plt.figure(figsize=(10, 3))
         # fig.add_subplot(1, 3, 1)
         # plt.imshow(pred, cmap='gray', vmin=0.0, vmax=1.0)
         # fig.add_subplot(1, 3, 2)
-        # plt.imshow(gt, cmap='gray', vmin=0.0, vmax=1.0)
+        # if gt is not None:
+        #     plt.imshow(gt, cmap='gray', vmin=0.0, vmax=1.0)
         # fig.add_subplot(1, 3, 3)
         # plt.imshow(input_image, vmin=0.0, vmax=1.0)
         #
@@ -730,8 +595,12 @@ class Trainer:
 
 
 def main():
-    trainer = Trainer()
-    trainer.train()
+    if True:
+        trainer = Trainer()
+        trainer.train()
+    else:
+        trainer = Trainer(load_last_snapshot=True)
+        trainer.validate()
     pass
 
 
