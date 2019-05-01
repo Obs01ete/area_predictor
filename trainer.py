@@ -79,9 +79,10 @@ class Sample:
 class CustomDataset:
     """ Class that reads samples of a custom dataset from a disk and preprocesses them. """
 
-    def __init__(self, folder):
+    def __init__(self, folder, preprocess_fn=None):
         self._ext = ".png"
         self._folder = folder
+        self._preprocess_fn = preprocess_fn
         name_list = glob.glob(os.path.join(folder, "*" + self._ext))
         raw_name_list = [os.path.splitext(os.path.split(p)[-1])[0] for p in name_list]
         self._name_list = [n for n in raw_name_list if self._parse_name(n) is not None]
@@ -95,10 +96,11 @@ class CustomDataset:
         path = os.path.join(self._folder, item + self._ext)
         image_pil = Image.open(path)
         image_hwc = np.asarray(image_pil)
-        image_hwc = image_hwc[:, :, :3] # throw away alpha channel
         anno_hw = self._parse_name(item)
-        image_chw = np.transpose(image_hwc, (2, 0, 1)) / 255.0
-        image_tensor_chw = torch.from_numpy(image_chw).type(torch.float32)
+        if self._preprocess_fn is not None:
+            image_tensor_chw = self._preprocess_fn(image_hwc)
+        else:
+            image_tensor_chw = None
         return Sample(image_hwc, anno_hw, item, image_tensor_chw, None)
 
     def _parse_name(self, name: str) -> Union[np.ndarray, None]:
@@ -177,13 +179,20 @@ class DatasetDispatcher:
              work_shape = (3, 128, 128) # work resolution of a NN
              ):
 
-        self._custom_dataset = CustomDataset("data/")
+        self._custom_dataset = CustomDataset("data/", self.preprocess_fn)
         self._image_shape = work_shape
         self._synthetic_dataset = SyntheticDataset(self._image_shape)
         self._val_names = self._custom_dataset.get_list()
         print("Custom dataset size =", len(self._val_names))
 
-    def _tensor_custom_to_work_reso(self, tensor):
+    @staticmethod
+    def preprocess_fn(image_hwc: np.ndarray) -> torch.Tensor:
+        image_hwc3 = image_hwc[:, :, :3]  # throw away alpha channel
+        image_chw = np.transpose(image_hwc3, (2, 0, 1)) / 255.0
+        image_tensor_chw = torch.from_numpy(image_chw).type(torch.float32)
+        return image_tensor_chw
+
+    def tensor_custom_to_work_reso(self, tensor):
         tensor = F.interpolate(
             tensor.unsqueeze(0),
             size=self._image_shape[1:],
@@ -196,6 +205,12 @@ class DatasetDispatcher:
             size=self._custom_dataset.get_image_shape()[1:],
             mode='nearest').squeeze(0)
         return tensor
+
+    def decode_prediction(self, pred: torch.Tensor) -> np.ndarray:
+        pred_custom_res = self.tensor_work_to_custom(pred)
+        mask = pred_custom_res > 0.5
+        area = mask.sum()
+        return area.detach().cpu().item()
 
     def train_gen(self, batches_per_epoch, batch_size):
         """ Train generator returns full-size batches. """
@@ -212,7 +227,7 @@ class DatasetDispatcher:
         for name in self._val_names:
             sample = self._custom_dataset.get_item(name)
             sample.image_tensor = \
-                self._tensor_custom_to_work_reso(sample.image_tensor)
+                self.tensor_custom_to_work_reso(sample.image_tensor)
             yield sample
 
     def get_image_shape(self):
@@ -515,13 +530,8 @@ class Trainer:
             pred = self._net.forward(sample.image_tensor)
             loss, details = self._net.loss(pred, sample.segmentation_tensor)
 
-            def decode_prediction(pred: torch.Tensor) -> np.ndarray:
-                pred_custom_res = self._dispatcher.tensor_work_to_custom(pred)
-                mask = pred_custom_res > 0.5
-                area = mask.sum()
-                return area.detach().cpu().item()
+            pred_area = self._dispatcher.decode_prediction(pred)
 
-            pred_area = decode_prediction(pred)
             anno_hw = sample.anno_hw
             gt_area = anno_hw[0] * anno_hw[1]
             relative_error = abs(pred_area - gt_area) / gt_area
@@ -542,6 +552,10 @@ class Trainer:
         print("Average relative area error = {:0.6f}".format(average_relative_error))
 
         pass
+
+    def get_net(self):
+        return self._net
+
 
     def _render_prediction(self, pred: np.ndarray, gt: np.ndarray, input_image: np.ndarray):
         """
@@ -564,6 +578,32 @@ class Trainer:
         # plt.show()
 
         pass
+
+
+
+class Predictor:
+    """ Function object to perform predictions. """
+
+    def __init__(self):
+        self._trainer = Trainer(load_last_snapshot=True)
+
+    def __call__(self, img: np.ndarray) -> int:
+        """
+        Makes prediction of the area based on the input image.
+        :param img: numpy image in format [H, W, C] where C is RGB or RGBA
+        :return: area of a rectangle in pixels
+        """
+        assert len(img.shape) == 3
+        assert img.shape[2] in (3, 4)
+        dispatcher = DatasetDispatcher()
+        tensor = dispatcher.preprocess_fn(img)
+        tensor = dispatcher.tensor_custom_to_work_reso(tensor)
+        tensor = tensor.unsqueeze(0)
+        net = self._trainer.get_net()
+        net.eval()
+        pred = net(tensor)
+        result = dispatcher.decode_prediction(pred)
+        return result
 
 
 def main():
