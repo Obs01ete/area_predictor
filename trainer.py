@@ -5,6 +5,7 @@ import math
 import numpy as np
 from PIL import Image
 from typing import Union, List
+from argparse import ArgumentParser
 
 import torch
 import torch.nn as nn
@@ -14,6 +15,11 @@ import torchsummary
 
 
 class Sample:
+    """
+    This class represents either one sample or a batch of samples.
+    A sample keeps both input and target tensors as well as auxiliary
+    payload such as sample name.
+    """
 
     def __init__(
             self,
@@ -22,6 +28,14 @@ class Sample:
             name: Union[str, List[str]],
             image_tensor: torch.Tensor,
             segmentation_tensor: torch.Tensor):
+        """
+        Constructor.
+        :param image: original image
+        :param anno_hw: annotated rectangle width/height
+        :param name: text name of a sample
+        :param image_tensor: input tensor to feed into NN
+        :param segmentation_tensor: target for semantic segmentation
+        """
 
         self.image = image
         self.anno_hw = anno_hw
@@ -30,12 +44,14 @@ class Sample:
         self.segmentation_tensor = segmentation_tensor
 
     def cuda(self):
+        """ Push all tensors to cuda. """
         if self.image_tensor is not None:
             self.image_tensor = self.image_tensor.cuda()
         if self.segmentation_tensor is not None:
             self.segmentation_tensor = self.segmentation_tensor.cuda()
 
     def batchify(self):
+        """ Create a batch out of one sample. """
         if self.image_tensor is not None:
             self.image_tensor = self.image_tensor.unsqueeze(dim=0)
         if self.segmentation_tensor is not None:
@@ -43,6 +59,7 @@ class Sample:
 
     @staticmethod
     def collate(batch_list):
+        """ Create a batch out of a list of samples. """
         images = [t.image for t in batch_list]
         annos = [t.anno_hw for t in batch_list]
         image_tensor = torch.stack(
@@ -60,6 +77,7 @@ class Sample:
 
 
 class CustomDataset:
+    """ Class that reads samples of a custom dataset from a disk and preprocesses them. """
 
     def __init__(self, folder):
         self._ext = ".png"
@@ -98,6 +116,10 @@ class CustomDataset:
 
 
 class SyntheticDataset:
+    """
+    Since the custom dataset is too small, we train on a generated images with
+    presumably wider representativeness of samples.
+    """
 
     def __init__(self, image_shape_chw):
         self._image_shape_chw = image_shape_chw
@@ -115,6 +137,7 @@ class SyntheticDataset:
         color_fg = np.random.randint(256, size=3)
         color_bg = np.reshape(color_bg, (-1, 1, 1))
         color_fg = np.reshape(color_fg, (-1, 1, 1))
+        # Continue mining until a big enough sample is found
         while True:
             left, right = np.sort(np.random.randint(w, size=2))
             top, bottom = np.sort(np.random.randint(h, size=2))
@@ -124,9 +147,11 @@ class SyntheticDataset:
                 continue
             break
 
+        # Create input image
         image_chw[...] = color_bg
         image_chw[:, top:bottom, left:right] = color_fg
 
+        # Create target segmentation
         segmentation_tensor[top:bottom, left:right] = 1.0
 
         anno_hw[0] = bottom - top
@@ -142,11 +167,14 @@ class SyntheticDataset:
 
 
 class DatasetDispatcher:
+    """
+    Class to multiplex synthetic and custom datasets.
+    Provides generators for train and validation batches.
+    """
 
     def __init__(
             self,
-             work_shape = (3, 32, 32)
-             #work_shape = (3, 128, 128)
+             work_shape = (3, 128, 128) # work resolution of a NN
              ):
 
         self._custom_dataset = CustomDataset("data/")
@@ -170,6 +198,7 @@ class DatasetDispatcher:
         return tensor
 
     def train_gen(self, batches_per_epoch, batch_size):
+        """ Train generator returns full-size batches. """
         for i in range(batches_per_epoch):
             sample_list = []
             for ib in range(batch_size):
@@ -179,6 +208,7 @@ class DatasetDispatcher:
             yield batch
 
     def val_gen(self):
+        """ Validation generator returns quasi-batches of size 1. """
         for name in self._val_names:
             sample = self._custom_dataset.get_item(name)
             sample.image_tensor = \
@@ -216,6 +246,7 @@ def Upconv2x2(in_channels, out_channels):
 
 
 class DownConv(nn.Module):
+    """ Block UNet encoder. """
 
     def __init__(self, in_channels, out_channels, has_pool=True):
         super().__init__()
@@ -237,6 +268,7 @@ class DownConv(nn.Module):
 
 
 class UpConv(nn.Module):
+    """ Block of UNet decoder. """
 
     def __init__(self, in_channels, out_channels):
         super().__init__()
@@ -255,7 +287,7 @@ class UpConv(nn.Module):
 
 
 class UNet(nn.Module):
-    """ Based on https://arxiv.org/abs/1505.04597 """
+    """ Implementation of UNet based on https://arxiv.org/abs/1505.04597 """
 
     def __init__(
             self,
@@ -274,6 +306,7 @@ class UNet(nn.Module):
         down_convs = []
         up_convs = []
 
+        # Create encoder blocks
         outs = None
         for i in range(num_levels):
             ins = self._in_channels if i == 0 else outs
@@ -283,6 +316,7 @@ class UNet(nn.Module):
             down_conv = DownConv(ins, outs, has_pool=pooling)
             down_convs.append(down_conv)
 
+        # Create decoder blocks
         for i in range(num_levels - 1):
             ins = outs
             outs = ins // 2
@@ -319,6 +353,7 @@ class UNet(nn.Module):
 
 
 class Net(nn.Module):
+    """ The entire NN. Encapsulates UNet and corresponding loss. """
 
     def __init__(self, input_shape_chw):
         super().__init__()
@@ -348,6 +383,11 @@ class Net(nn.Module):
         return pred
 
     def loss(self, pred: torch.Tensor, segmentation_gt: torch.Tensor):
+        """
+        Loss could be more complex, but we just go with
+        vanilla binary cross entropy.
+        """
+
         if segmentation_gt is not None:
             segmentation_loss = self._seg_loss(
                 pred.view(-1),
@@ -364,8 +404,14 @@ class Net(nn.Module):
 
 
 class Trainer:
+    """ Class to manage train/validation cycles. """
 
     def __init__(self, load_last_snapshot=False):
+        """
+        Constructor.
+        :param load_last_snapshot: whether to load the last snapshot from disk
+        """
+
         has_gpu = torch.cuda.device_count() > 0
         if has_gpu:
             print(torch.cuda.get_device_name(0))
@@ -380,14 +426,18 @@ class Trainer:
 
         self._snapshot_name = "snapshot.pth"
         if load_last_snapshot:
-            self._net.load_state_dict(torch.load(self._snapshot_name))
+            load_kwargs = {} if self.use_gpu else {'map_location': 'cpu'}
+            self._net.load_state_dict(torch.load(self._snapshot_name, **load_kwargs))
 
+        # Print summary in Keras style
         shape_chw = tuple(self._dispatcher.get_image_shape())
         print("Work image shape =", shape_chw)
         torchsummary.summary(self._net, input_size=shape_chw)
         pass
 
     def train(self):
+        """ Perform training of the network. """
+
         num_epochs = 50
         batch_size = 16
         batches_per_epoch = 1024
@@ -433,8 +483,10 @@ class Trainer:
 
             scheduler.step()
 
+            # Save after every epoch
             torch.save(self._net.state_dict(), self._snapshot_name)
 
+            # Validate every epoch
             self.validate()
 
             pass
@@ -447,6 +499,7 @@ class Trainer:
         print("Train finished!")
 
     def validate(self):
+        """ Validation cycle. Performed over a custom dataset. """
         print("Validation")
 
         self._net.eval()
@@ -491,6 +544,11 @@ class Trainer:
         pass
 
     def _render_prediction(self, pred: np.ndarray, gt: np.ndarray, input_image: np.ndarray):
+        """
+        This function visualizes predictions. Works nicely only
+        in ipython notebook thus commented out here.
+        """
+
         # % matplotlib inline
         # import matplotlib.pyplot as plt
         #
@@ -509,19 +567,24 @@ class Trainer:
 
 
 def main():
-    if True:
-        trainer = Trainer()
-        trainer.train()
-    else:
+    """
+    Default mode of operation is training. To run validation of a trained
+    model over a custom dataset, run:
+        trainer.py --validate
+    """
+    parser = ArgumentParser()
+    parser.add_argument('--validate', default=False, action='store_true')
+    args = parser.parse_args()
+
+    if args.validate:
         trainer = Trainer(load_last_snapshot=True)
         trainer.validate()
+    else:
+        trainer = Trainer()
+        trainer.train()
     pass
 
 
 if __name__ == "__main__":
     main()
-
-
-
-
 
